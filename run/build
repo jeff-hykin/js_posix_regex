@@ -1,0 +1,171 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i bash -vv --pure -p bash emscripten deno coreutils sd -I nixpkgs=https://github.com/NixOS/nixpkgs/archive/87cc06983c14876bb56a6a84935d1a3968f35999.tar.gz
+
+echo '#'  
+echo '#'  
+echo '# Now starting the actual '  
+echo '#'  
+echo '#'  
+
+em++ --cache './cache.ignore/' \
+    -s NO_EXIT_RUNTIME=1 \
+    -s ENVIRONMENT=web \
+    -s "EXPORTED_FUNCTIONS=['_getCapturedGroups','_main']" \
+    -s "EXPORTED_RUNTIME_METHODS=['ccall','stringToNewUTF8']" \
+    -s WASM=1 \
+    hello.cpp -o hello.js
+
+deno run -A https://deno.land/x/binaryify@2.2.0.7/binaryify.js ./hello.wasm
+cat ./hello.js > ./hello.export.js
+echo '
+export { Module }
+' >> ./hello.export.js
+deno run -A https://raw.githubusercontent.com/jeff-hykin/deno_bundle/master/main.js ./hello.export.js > ./hello2.min.js
+
+
+read -r -d '' FIND <<'HEREDOC_NAME'
+var wasmBinaryFile;
+wasmBinaryFile = "hello.wasm";
+if (!isDataURI(wasmBinaryFile)) {
+  wasmBinaryFile = locateFile(wasmBinaryFile);
+}
+function getBinarySync(file) {
+  if (file == wasmBinaryFile && wasmBinary) {
+    return new Uint8Array(wasmBinary);
+  }
+  if (readBinary) {
+    return readBinary(file);
+  }
+  throw "both async and sync fetching of the wasm failed";
+}
+function getBinaryPromise(binaryFile) {
+  if (!wasmBinary && (ENVIRONMENT_IS_WEB || ENVIRONMENT_IS_WORKER)) {
+    if (typeof fetch == "function") {
+      return fetch(binaryFile, { credentials: "same-origin" }).then((response) => {
+        if (!response["ok"]) {
+          throw "failed to load wasm binary file at '" + binaryFile + "'";
+        }
+        return response["arrayBuffer"]();
+      }).catch(() => getBinarySync(binaryFile));
+    }
+  }
+  return Promise.resolve().then(() => getBinarySync(binaryFile));
+}
+function instantiateArrayBuffer(binaryFile, imports, receiver) {
+  return getBinaryPromise(binaryFile).then((binary) => {
+    return WebAssembly.instantiate(binary, imports);
+  }).then((instance) => {
+    return instance;
+  }).then(receiver, (reason) => {
+    err(`failed to asynchronously prepare wasm: ${reason}`);
+    if (isFileURI(wasmBinaryFile)) {
+      err(`warning: Loading from a file URI (${wasmBinaryFile}) is not supported in most browsers. See https://emscripten.org/docs/getting_started/FAQ.html#how-do-i-run-a-local-webserver-for-testing-why-does-my-program-stall-in-downloading-or-preparing`);
+    }
+    abort(reason);
+  });
+}
+function instantiateAsync(binary, binaryFile, imports, callback) {
+  if (!binary && typeof WebAssembly.instantiateStreaming == "function" && !isDataURI(binaryFile) && typeof fetch == "function") {
+    return fetch(binaryFile, { credentials: "same-origin" }).then((response) => {
+      var result = WebAssembly.instantiateStreaming(response, imports);
+      return result.then(
+        callback,
+        function(reason) {
+          err(`wasm streaming compile failed: ${reason}`);
+          err("falling back to ArrayBuffer instantiation");
+          return instantiateArrayBuffer(binaryFile, imports, callback);
+        }
+      );
+    });
+  }
+  return instantiateArrayBuffer(binaryFile, imports, callback);
+}
+function createWasm() {
+  var info = {
+    "env": wasmImports,
+    "wasi_snapshot_preview1": wasmImports
+  };
+  function receiveInstance(instance, module) {
+    wasmExports = instance.exports;
+    wasmMemory = wasmExports["memory"];
+    assert(wasmMemory, "memory not found in wasm exports");
+    updateMemoryViews();
+    addOnInit(wasmExports["__wasm_call_ctors"]);
+    removeRunDependency("wasm-instantiate");
+    return wasmExports;
+  }
+  addRunDependency("wasm-instantiate");
+  var trueModule = Module;
+  function receiveInstantiationResult(result) {
+    assert(Module === trueModule, "the Module object should not be replaced during async compilation - perhaps the order of HTML elements is wrong?");
+    trueModule = null;
+    receiveInstance(result["instance"]);
+  }
+  if (Module["instantiateWasm"]) {
+    try {
+      return Module["instantiateWasm"](info, receiveInstance);
+    } catch (e) {
+      err(`Module.instantiateWasm callback failed with error: ${e}`);
+      return false;
+    }
+  }
+  instantiateAsync(wasmBinary, wasmBinaryFile, info, receiveInstantiationResult);
+  return {};
+}
+HEREDOC_NAME
+
+read -r -d '' REPLACE <<'HEREDOC_NAME'
+import uint8ArrayForHelloWasm from "./hello.wasm.binaryified.js"
+function instantiateArrayBuffer(binaryFile, imports, receiver) {
+  const binary = uint8ArrayForHelloWasm
+  return WebAssembly.instantiate(binary, imports).then((instance) => {
+    return instance;
+  }).then(receiver, (reason) => {
+    err(`failed to asynchronously prepare wasm: ${reason}`);
+    abort(reason);
+  });
+}
+function instantiateAsync(binary, binaryFile, imports, callback) {
+  return instantiateArrayBuffer(null, imports, callback)
+}
+function createWasm() {
+  var info = {
+    "env": wasmImports,
+    "wasi_snapshot_preview1": wasmImports
+  };
+  function receiveInstance(instance, module) {
+    wasmExports = instance.exports;
+    wasmMemory = wasmExports["memory"];
+    assert(wasmMemory, "memory not found in wasm exports");
+    updateMemoryViews();
+    addOnInit(wasmExports["__wasm_call_ctors"]);
+    removeRunDependency("wasm-instantiate");
+    return wasmExports;
+  }
+  addRunDependency("wasm-instantiate");
+  var trueModule = Module;
+  function receiveInstantiationResult(result) {
+    assert(Module === trueModule, "the Module object should not be replaced during async compilation - perhaps the order of HTML elements is wrong?");
+    trueModule = null;
+    receiveInstance(result["instance"]);
+  }
+  if (Module["instantiateWasm"]) {
+    try {
+      return Module["instantiateWasm"](info, receiveInstance);
+    } catch (e) {
+      err(`Module.instantiateWasm callback failed with error: ${e}`);
+      return false;
+    }
+  }
+  instantiateAsync(wasmBinary, null, info, receiveInstantiationResult);
+  return {};
+}
+HEREDOC_NAME
+
+cat ./hello2.min.js | sd --fixed-strings "$FIND" "$REPLACE" > ./hello.min.js
+# echo ''
+# echo 'import {Module} from "./hello.min.js"'
+# echo 'Module.ccall("getCapturedGroups", "string", ["string", "string"], [("^([0-9]{3})-([0-9]{2})-([[:digit:]]{4})$"), ("123-45-6789")])'
+# echo ''
+
+# deno
